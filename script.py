@@ -25,22 +25,34 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
 # Optional: undetected_chromedriver (pip install undetected-chromedriver)
 try:
     import undetected_chromedriver as uc
 except Exception:
     uc = None
 
-from dotenv import load_dotenv
-import requests
+# -------------------------------------------------------------------------
+# 2️⃣ hcaptcha_solver (pure‑Python, no key) --------------------------------
+# -------------------------------------------------------------------------
+# Make sure you installed it first:  pip install hcaptcha_solver
+try:
+    from hcaptcha_solver.hcaptcha_solver import Captcha_Solver
+except Exception as e:
+    print("hcaptcha_solver import error:", repr(e))
+    raise
+
+# Instantiate the solver once
+hcaptcha_solver = Captcha_Solver()
 
 # -------------------------------------------------------------------------
-# 2️⃣ Load environment variables
+# 3️⃣ Load environment variables
 # -------------------------------------------------------------------------
+from dotenv import load_dotenv
 load_dotenv()
 
 # -------------------------------------------------------------------------
-# 3️⃣ Global configuration
+# 4️⃣ Global configuration
 # -------------------------------------------------------------------------
 CHROME_USER_DATA = Path(os.getenv("CHROME_USER_DATA", "~/automation_chrome_user_data")).expanduser()
 PROFILES = [p.strip() for p in os.getenv("PROFILES", "Profile-1,Profile-2,Profile-3").split(",")]
@@ -51,7 +63,7 @@ OUTPUT_FILE = Path(os.getenv("OUTPUT_FILE", "results_all_debug.txt")).expanduser
 TARGET_FILE = Path(os.getenv("TARGET_FILE", "otp_free_verified_debug.txt")).expanduser()
 
 # -------------------------------------------------------------------------
-# 4️⃣ Logging configuration
+# 5️⃣ Logging configuration
 # -------------------------------------------------------------------------
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 logging.basicConfig(
@@ -65,7 +77,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------------
-# 5️⃣ Helper: random user‑agents
+# 6️⃣ Helper: random user‑agents
 # -------------------------------------------------------------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
@@ -77,7 +89,7 @@ USER_AGENTS = [
 ]
 
 # -------------------------------------------------------------------------
-# 6️⃣ Helper: proxy rotation (optional)
+# 7️⃣ Helper: proxy rotation (optional)
 # -------------------------------------------------------------------------
 PROXIES: List[str] = []
 
@@ -92,7 +104,7 @@ def load_proxies(file: Path) -> None:
         logger.warning(f"Could not load proxies from {file}: {e}")
 
 # -------------------------------------------------------------------------
-# 7️⃣ Helper: CAPTCHA detection
+# 8️⃣ Helper: CAPTCHA detection
 # -------------------------------------------------------------------------
 CAPTCHA_SELECTORS = [
     # Visible iframes / divs
@@ -161,7 +173,7 @@ def wait_for_manual_captcha(driver: webdriver.Chrome, timeout: int = 300) -> boo
         return False
 
 # -------------------------------------------------------------------------
-# 8️⃣ Helper: Pass‑key detection
+# 9️⃣ Helper: Pass‑key detection
 # -------------------------------------------------------------------------
 def passkey_present(driver: webdriver.Chrome) -> bool:
     """
@@ -205,7 +217,7 @@ def passkey_present(driver: webdriver.Chrome) -> bool:
     return False
 
 # -------------------------------------------------------------------------
-# 9️⃣ Helper: 2Captcha integration for reCAPTCHA & hCaptcha
+# 10️⃣ Helper: 2Captcha integration for reCAPTCHA & hCaptcha
 # -------------------------------------------------------------------------
 CAPTCHA_API_KEY: Optional[str] = os.getenv("CAPTCHA_API_KEY")
 
@@ -255,8 +267,57 @@ def _2captcha_request(method: str, driver: webdriver.Chrome, **kwargs) -> str:
 def solve_recaptcha_v2(driver: webdriver.Chrome) -> str:
     return _2captcha_request("recaptcha", driver)
 
+# -------------------------------------------------------------------------
+# 11️⃣ Local hCaptcha solver (fallback)
+# -------------------------------------------------------------------------
+def _solve_hcaptcha_local(driver: webdriver.Chrome) -> Optional[str]:
+    """
+    Try to solve hCaptcha locally using hcaptcha_solver.
+    Returns a token string on success, or None on failure.
+    """
+    try:
+        # Grab the site‑key from the iframe
+        iframe = driver.find_element(By.CSS_SELECTOR, "iframe[src*='hcaptcha']")
+        # The iframe contains a <div data-sitekey="..."> – grab it
+        sitekey = iframe.get_attribute("data-sitekey")
+        if not sitekey:
+            # Some sites embed the key in a sibling div
+            sitekey = driver.execute_script(
+                "return document.querySelector('div[data-sitekey]').dataset.sitekey"
+            )
+        if not sitekey:
+            logger.warning("Could not locate hCaptcha sitekey")
+            return None
+
+        page_url = driver.current_url
+        token = hcaptcha_solver.solve(sitekey, page_url)
+        if token:
+            logger.info("hcaptcha_solver returned a token")
+            return token
+        logger.warning("hcaptcha_solver did not return a token")
+    except Exception as e:
+        logger.warning(f"hcaptcha_solver failed: {e}")
+    return None
+
 def solve_hcaptcha(driver: webdriver.Chrome) -> str:
-    return _2captcha_request("hcaptcha", driver)
+    """
+    Try local solver first; if it fails, fall back to the free API key
+    (if present). Raises RuntimeError if neither works.
+    """
+    token = _solve_hcaptcha_local(driver)
+    if token:
+        return token
+
+    # Local solver failed – try the API key
+    if CAPTCHA_API_KEY:
+        try:
+            token = _2captcha_request("hcaptcha", driver)
+            logger.info("Solved hCaptcha via API key")
+            return token
+        except Exception as e:
+            logger.warning(f"API key fallback failed: {e}")
+
+    raise RuntimeError("hcaptcha_solver failed and no (or unusable) API key available")
 
 def inject_recaptcha_token(driver: webdriver.Chrome, token: str) -> None:
     """
@@ -289,7 +350,7 @@ def inject_hcaptcha_token(driver: webdriver.Chrome, token: str) -> None:
         """)
 
 # -------------------------------------------------------------------------
-# 10️⃣ Browser wrapper
+# 12️⃣ Browser wrapper
 # -------------------------------------------------------------------------
 def chrome_options_for_profile(profile_name: str, proxy: Optional[str] = None) -> Options:
     options = Options()
@@ -356,7 +417,7 @@ class BrowserWrapper:
             logger.info("Browser session closed.")
 
 # -------------------------------------------------------------------------
-# 11️⃣ Main checker class
+# 13️⃣ Main checker class
 # -------------------------------------------------------------------------
 class LocalProjectCheckerBypass:
     def __init__(self, profile: str, proxy: Optional[str] = None):
@@ -551,7 +612,7 @@ class LocalProjectCheckerBypass:
         self.browser.quit()
 
 # -------------------------------------------------------------------------
-# 12️⃣ Utility: read combos
+# 14️⃣ Utility: read combos
 # -------------------------------------------------------------------------
 def load_combos(file_path: Path) -> List[Tuple[str, str]]:
     combos = []
@@ -574,7 +635,7 @@ def append_line(path: Path, line: str) -> None:
         f.write(line + "\n")
 
 # -------------------------------------------------------------------------
-# 13️⃣ Main routine
+# 15️⃣ Main routine
 # -------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
